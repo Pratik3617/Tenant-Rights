@@ -28,9 +28,33 @@ import pdfplumber
 import pytesseract
 from PIL import Image
 
+from constants import (
+    ADAPTIVE_THRESH_BLOCK_SIZE,
+    ADAPTIVE_THRESH_C,
+    CLEANUP_PATTERNS,
+    DENOISE_H,
+    DIGITAL_CHAR_THRESHOLD,
+    DILATE_KERNEL_SIZE,
+    GARBLED_NON_ASCII_RATIO,
+    GARBLED_SINGLE_CHAR_RATIO,
+    HOUGH_THRESHOLD,
+    HYBRID_CONFIDENCE_BOOST,
+    HYBRID_CONFIDENCE_CAP,
+    HYBRID_UNIQUE_WORD_MIN_LEN,
+    HYBRID_UNIQUE_WORD_RATIO,
+    MAX_DESKEW_ANGLE_DEG,
+    MIN_DESKEW_ANGLE_DEG,
+    MIXED_TEXT_MIN_CHARS,
+    OCR_CHARACTER_FIXES,
+    OCR_CONFIDENCE_THRESHOLD,
+    RASTERIZE_DPI,
+    TESSERACT_CONFIG,
+)
+
 logger = logging.getLogger(__name__)
 
 
+# Data structures
 class PageType(str, Enum):
     DIGITAL      = "digital"       # clean, machine-readable text
     SCANNED      = "scanned"       # image-only, needs OCR
@@ -76,35 +100,7 @@ class DocumentResult:
         return self.digital_pages == 0
 
 
-# -------------Constants — tuned for Indian government PDFs-------------
-
-# Minimum chars per page to consider it "has text"
-DIGITAL_CHAR_THRESHOLD   = 100
-
-# If OCR confidence drops below this, flag the page
-OCR_CONFIDENCE_THRESHOLD = 60.0
-
-# DPI for rasterization — 200 is the sweet spot for legal text:
-# higher = better accuracy, slower; lower = faster, misses fine print
-RASTERIZE_DPI = 200
-
-# Tesseract config — PSM 6: assume uniform block of text (best for legal docs)
-# OEM 3: use LSTM engine (most accurate for English government text)
-TESSERACT_CONFIG = "--psm 6 --oem 3 -l eng"
-
-# Legal text post-processing patterns
-_CLEANUP_PATTERNS = [
-    (r'\f',                    '\n'),         # form feed → newline
-    (r'[ \t]+\n',              '\n'),         # trailing whitespace
-    (r'\n{3,}',                '\n\n'),       # collapse excess blank lines
-    (r'(?<=[a-z])-\n(?=[a-z])', ''),         # dehyphenate mid-word line breaks
-    (r'\b(\d+)\s*\.\s*([A-Z])', r'\1. \2'),  # fix "15.Eviction" → "15. Eviction"
-    (r'\bS\s*e\s*c\s*t\s*i\s*o\s*n\b', 'Section'),  # fix spaced OCR chars
-]
-
-
 # Core handler
-
 class GovernmentPDFOCRHandler:
     """
     Smart per-page PDF processor. Detects page type and routes to the
@@ -212,12 +208,12 @@ class GovernmentPDFOCRHandler:
             return PageType.DIGITAL, f"clean digital text ({char_count} chars)"
 
         if has_images:
-            if char_count > 20:
+            if char_count > MIXED_TEXT_MIN_CHARS:
                 return PageType.MIXED, f"partial text ({char_count} chars) + images"
             return PageType.SCANNED, f"image-only page (no extractable text)"
 
         if char_count > 0:
-            return PageType.DIGITAL, f"sparse text ({char_count} chars), no images"
+            return PageType.DIGITAL, f"sparse digital text ({char_count} chars), no images"
 
         return PageType.EMPTY, "blank page"
 
@@ -341,7 +337,7 @@ class GovernmentPDFOCRHandler:
             page_number=page_num,
             page_type=PageType.MIXED,
             text=merged,
-            confidence=min(0.9, ocr_result.confidence + 0.1),  # boost for hybrid
+            confidence=min(HYBRID_CONFIDENCE_CAP, ocr_result.confidence + HYBRID_CONFIDENCE_BOOST),
             extraction_method="hybrid",
             warnings=ocr_result.warnings
         )
@@ -369,7 +365,7 @@ class GovernmentPDFOCRHandler:
         img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
 
         # 1. Denoise — removes scanner artifacts, smudges
-        img_cv = cv2.fastNlMeansDenoising(img_cv, h=10)
+        img_cv = cv2.fastNlMeansDenoising(img_cv, h=DENOISE_H)
 
         # 2. Adaptive threshold — handles uneven lighting across page
         #    Better than Otsu for pages with shadows at the edges
@@ -377,15 +373,15 @@ class GovernmentPDFOCRHandler:
             img_cv, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            blockSize=31,   # larger block = handles more lighting variation
-            C=10
+            blockSize=ADAPTIVE_THRESH_BLOCK_SIZE,
+            C=ADAPTIVE_THRESH_C
         )
 
         # 3. Deskew — correct scanner tilt (common in government docs)
         img_cv = self._deskew(img_cv)
 
         # 4. Dilate slightly — connects broken characters from low ink
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, DILATE_KERNEL_SIZE)
         img_cv = cv2.dilate(img_cv, kernel, iterations=1)
 
         return Image.fromarray(img_cv)
@@ -400,16 +396,15 @@ class GovernmentPDFOCRHandler:
         edges = cv2.Canny(image, 50, 150, apertureSize=3)
 
         # Detect lines via Hough transform
-        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
+        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=HOUGH_THRESHOLD)
         if lines is None:
             return image
 
-        # Compute median angle from detected lines
         angles = []
         for line in lines:
             rho, theta = line[0]
             angle_deg = np.degrees(theta) - 90
-            if -45 < angle_deg < 45:
+            if -MAX_DESKEW_ANGLE_DEG < angle_deg < MAX_DESKEW_ANGLE_DEG:
                 angles.append(angle_deg)
 
         if not angles:
@@ -417,8 +412,7 @@ class GovernmentPDFOCRHandler:
 
         median_angle = float(np.median(angles))
 
-        # Skip negligible skew
-        if abs(median_angle) < 0.5:
+        if abs(median_angle) < MIN_DESKEW_ANGLE_DEG:
             return image
 
         logger.debug(f"    Correcting skew: {median_angle:.2f}°")
@@ -454,11 +448,10 @@ class GovernmentPDFOCRHandler:
 
         # Find OCR words not in digital (unique content from scan regions)
         unique_ocr_words = [
-            w for w in ocr_words if w not in digital_words and len(w) > 3
+            w for w in ocr_words if w not in digital_words and len(w) > HYBRID_UNIQUE_WORD_MIN_LEN
         ]
 
-        # If OCR has <10% unique content, digital is sufficient
-        if len(unique_ocr_words) < 0.10 * len(ocr_words):
+        if len(unique_ocr_words) < HYBRID_UNIQUE_WORD_RATIO * len(ocr_words):
             return digital
 
         # Otherwise combine — digital first (more trustworthy), OCR supplements
@@ -473,17 +466,10 @@ class GovernmentPDFOCRHandler:
         if not text:
             return ""
 
-        for pattern, replacement in _CLEANUP_PATTERNS:
+        for pattern, replacement in CLEANUP_PATTERNS:
             text = re.sub(pattern, replacement, text)
 
-        # Fix common OCR misreads in legal context
-        ocr_fixes = {
-            r'\bl\b(?=\s+\d)':        '1',   # lowercase L read as number 1
-            r'\bO\b(?=\s+\d)':        '0',   # uppercase O read as zero
-            r'§':                     'Section',  # section symbol
-            r'(?<=\d),(?=\d{3}\b)':   '',    # remove thousand separators in section refs
-        }
-        for pattern, fix in ocr_fixes.items():
+        for pattern, fix in OCR_CHARACTER_FIXES.items():
             text = re.sub(pattern, fix, text)
 
         return text.strip()
@@ -497,13 +483,13 @@ class GovernmentPDFOCRHandler:
         if not text:
             return False
         non_ascii = sum(1 for c in text if ord(c) > 127)
-        if non_ascii / len(text) > 0.15:
+        if non_ascii / len(text) > GARBLED_NON_ASCII_RATIO:
             return True
         words = text.split()
         if not words:
             return False
         single_chars = sum(1 for w in words if len(w) == 1)
-        return single_chars / len(words) > 0.20
+        return single_chars / len(words) > GARBLED_SINGLE_CHAR_RATIO
 
     # ── Result assembly ──────────────────────────
 

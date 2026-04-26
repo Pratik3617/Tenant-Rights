@@ -1,125 +1,133 @@
+"""
+legal_pdf_parser.py  (updated — Phase 2.1 replacement)
+-------------------------------------------------------
+Legal PDF parser that uses GovernmentPDFOCRHandler as its extraction backend.
+Replaces the original pdfplumber-only parser with full OCR support.
+
+The parser's job is still the same:
+  DocumentResult (text per page) → list[LegalSection] (structured sections)
+
+The OCR handler's job is: PDF file → DocumentResult (text per page).
+This file wires them together.
+"""
+
 import re
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
 from ocr_handler import GovernmentPDFOCRHandler, DocumentResult
+from constants import (
+    BARE_SECTION_PATTERN,
+    DEFINITION_BODY_MAX_LEN,
+    DEFINITION_BODY_MIN_LEN,
+    DEFINITION_TERM_MAX_LEN,
+    DEFINITION_TERM_MIN_LEN,
+    DEFINITIONS_PATTERN,
+    DEFINITIONS_SCAN_CHARS,
+    MIN_SECTION_MATCHES,
+    MIN_SECTION_WORDS,
+    RASTERIZE_DPI,
+    SECTION_PATTERN,
+    SECTION_REVIEW_CONFIDENCE_THRESHOLD,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# Data structures
 @dataclass
 class LegalSection:
     act: str
     jurisdiction: str
     section_number: str
-    title: str
+    section_title: str
     content: str
     page_start: int
     last_verified: str
-    ocr_confidence: float = field(default=1.0)
-    needs_review: bool = field(default=False)
+    ocr_confidence: float = 1.0          # new: propagated from OCR handler
+    needs_review: bool = False           # new: flagged for manual review
 
+
+# Updated parser
 class LegalPDFParser:
     """
-        Parses legal PDFs into structured LegalSection objects.
-        Uses GovernmentPDFOCRHandler for text extraction — handles digital,
-        scanned, and mixed PDFs automatically.
+    Parses legal PDFs into structured LegalSection objects.
+    Uses GovernmentPDFOCRHandler for text extraction — handles digital,
+    scanned, and mixed PDFs automatically.
+
+    All regex patterns and thresholds are defined in constants.py.
     """
-    # Matches: "Section 15A — Security Deposit"
-    #          "15A. Security Deposit"
-    #          "S. 15A Security Deposit"
-    SECTION_PATTERN = re.compile(
-        r'^(?:Section|Sec\.|S\.)\s*(\d+[A-Za-z]?)'   # "Section 15A" or "15A"
-        r'(?:\s*[.—–:-]\s*|\s+)'                       # separator
-        r'([A-Z][^\n]{3,80})',                          # title (3–80 chars)
-        re.MULTILINE
-    )
 
-    # Fallback: bare numbered sections like "15A. Deposit refund."
-    BARE_SECTION_PATTERN = re.compile(
-        r'^(\d+[A-Za-z]?)\.\s+([A-Z][^\n]{3,80})',
-        re.MULTILINE
-    )
-
-    # Definitions section header — used to extract definition blocks
-    DEFINITIONS_PATTERN = re.compile(
-        r'^(?:DEFINITIONS?|Interpretation|Meaning of terms)',
-        re.MULTILINE | re.IGNORECASE
-    )
-
-    def __init__(
-            self,
-            rasterize_dpi: int = 200,
-            preprocess_scans: bool = True,
-            min_section_words: int = 10,
-    ):
+    def __init__(self, preprocess_scans: bool = True):
         self.ocr_handler = GovernmentPDFOCRHandler(
-            rasterize_dpi=rasterize_dpi,
-            preprocess_scans=preprocess_scans
+            rasterize_dpi=RASTERIZE_DPI,
+            preprocess_scans=preprocess_scans,
         )
-        self.min_section_words = min_section_words
-        
+
     def parse(self, pdf_path: str, metadata: dict) -> list[LegalSection]:
-        """"
-            metadata = {
-                "act": "Maharashtra Rent Control Act 1999",
-                "jurisdiction": "india_maharashtra",
-                "last_verified": "2024-01",
-            }
         """
-        # Extract text (handles scanned/digital/mixed PDFs)
+        Main entry point.
+
+        metadata = {
+            "act": "Maharashtra Rent Control Act 1999",
+            "jurisdiction": "india_maharashtra",
+            "last_verified": "2024-01",
+        }
+        """
+        # 1. Extract text (handles scanned/digital/mixed automatically)
         doc_result: DocumentResult = self.ocr_handler.process_document(pdf_path)
 
         if not doc_result.full_text.strip():
-            logger.warning(f"No text extracted from {pdf_path}")
+            logger.error(f"No text extracted from {pdf_path}. Check file.")
             return []
-        
+
         logger.info(
             f"Extracted {len(doc_result.full_text.split()):,} words from "
             f"{doc_result.total_pages} pages "
             f"({doc_result.digital_pages} digital, {doc_result.scanned_pages} scanned)"
         )
 
-        # Build Page -> Confidence mapping for propagation
-        page_Confidence_map = {
-            p.page_number: p.confidence
-            for p in doc_result.pages
+        # 2. Build page → confidence mapping for propagation
+        page_confidence_map = {
+            p.page_number: p.confidence for p in doc_result.pages
         }
 
-        # Extract definitions block (injected into every chunk later)
+        # 3. Extract definitions block (injected into every chunk later)
         definitions = self._extract_definitions(doc_result.full_text)
-
         if definitions:
             logger.info(f"Found {len(definitions)} defined terms")
 
-        # split into sections
+        # 4. Split into sections
         sections = self._split_into_sections(
-            text = doc_result.full_text,
-            metadata = metadata,
-            page_confidence_map = page_Confidence_map,
-            doc_result = doc_result
+            text=doc_result.full_text,
+            metadata=metadata,
+            page_confidence_map=page_confidence_map,
+            doc_result=doc_result,
         )
 
-    def split_into_sections(
-            self,
-            text: str,
-            metadata: dict,
-            page_confidence_map: dict,
-            doc_result: DocumentResult
+        logger.info(f"Extracted {len(sections)} sections from {pdf_path}")
+        return sections
+
+    def _split_into_sections(
+        self,
+        text: str,
+        metadata: dict,
+        page_confidence_map: dict,
+        doc_result: DocumentResult,
     ) -> list[LegalSection]:
         """
-            Split full document text into LegalSection objects by detecting
-            section headers. Tries primary pattern first, falls back to bare
-            numbered sections.
+        Split full document text into LegalSection objects by detecting
+        section headers. Tries primary pattern first, falls back to bare
+        numbered sections.
         """
-        matches = list(self.SECTION_PATTERN.finditer(text))
+        matches = list(SECTION_PATTERN.finditer(text))
 
-        # fallback to bare numbered sections if primary finds < 3 sections
-        if len(matches) < 3:
+        if len(matches) < MIN_SECTION_MATCHES:
             logger.warning(
                 f"Primary section pattern found only {len(matches)} matches. "
                 f"Trying bare-number fallback."
             )
-
-            matches = list(self.BARE_SECTION_PATTERN.finditer(text))
+            matches = list(BARE_SECTION_PATTERN.finditer(text))
 
         if not matches:
             logger.error(
@@ -135,69 +143,68 @@ class LegalPDFParser:
                 last_verified=metadata["last_verified"],
                 ocr_confidence=doc_result.avg_ocr_confidence,
             )]
-        
+
         sections = []
         for i, match in enumerate(matches):
-            # section content = text from end of header to the start of next header (or end of doc)
+            # Section content = text from end of header to start of next header
             content_start = match.end()
-            content_end = matches[i+1].start() if i+1 < len(matches) else len(text)
+            content_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
             content = text[content_start:content_end].strip()
 
-            # skip near empty sections
-            if len(content.split()) < self.min_section_words:
+            # Skip near-empty sections
+            if len(content.split()) < MIN_SECTION_WORDS:
                 continue
 
             # Estimate page number from character offset
-            page_num = self._estimate_page_number(match.start(), doc_result)
+            page_num = self._estimate_page(match.start(), doc_result)
 
             # Get OCR confidence for that page (1.0 if digital)
-            confindence = page_confidence_map.get(page_num, 1.0)
+            confidence = page_confidence_map.get(page_num, 1.0)
 
             sections.append(LegalSection(
                 act=metadata["act"],
                 jurisdiction=metadata["jurisdiction"],
                 section_number=match.group(1),
-                title=match.group(2).strip(),
+                section_title=match.group(2).strip(),
                 content=content,
                 page_start=page_num,
                 last_verified=metadata["last_verified"],
-                ocr_confidence=confindence,
-                needs_review=(confindence < 0.65)
+                ocr_confidence=confidence,
+                needs_review=(confidence < SECTION_REVIEW_CONFIDENCE_THRESHOLD),
             ))
 
-    def _extract_definitions(self, text: str) -> dict:
-        """
-            Extract definitions block (if present) as a dict of term -> definition.
-            These will be injected into chunks that reference those terms.
+        return sections
 
-            Returns: {"landlord": "means the person entitled...", ...}
+    def _extract_definitions(self, text: str) -> dict[str, str]:
+        """
+        Extract term definitions from the definitions section.
+        These will be injected into chunks that reference those terms.
+
+        Returns: {"landlord": "means the person entitled...", ...}
         """
         definitions = {}
 
-        # find the definitions section
-        def_match = self.DEFINITIONS_PATTERN.search(text)
+        def_match = DEFINITIONS_PATTERN.search(text)
         if not def_match:
             return definitions
-        
-        # take the first 3000 chars after the header as the definitions block
-        def_block = text[def_match.end():def_match.end()+3000]
 
-        # match patterns like:
-        #   "landlord" means...
-        #   "premises" means...
+        def_block = text[def_match.end(): def_match.end() + DEFINITIONS_SCAN_CHARS]
+
         term_pattern = re.compile(
-            r'"([^"]{3,40})"\s+(?:means?|includes?|refers? to)\s+([^;.]{20,400})',
+            r'"([^"]{' + str(DEFINITION_TERM_MIN_LEN) + r',' + str(DEFINITION_TERM_MAX_LEN) + r'})"'
+            r'\s+(?:means?|includes?|refers? to)\s+'
+            r'([^;.]{' + str(DEFINITION_BODY_MIN_LEN) + r',' + str(DEFINITION_BODY_MAX_LEN) + r'})',
             re.IGNORECASE
         )
-
         for match in term_pattern.finditer(def_block):
             term = match.group(1).strip().lower()
             definition = match.group(2).strip()
             definitions[term] = definition
             logger.debug(f"  Definition: '{term}' = {definition[:60]}...")
-            return definitions
-        
-    def _estimate_page_number(self, char_offset: int, doc_result: DocumentResult) -> int:
+
+        return definitions
+
+    def _estimate_page(self, char_offset: int, doc_result: DocumentResult) -> int:
         """
         Estimate the page number for a character offset in the full text.
         Approximate — sufficient for metadata; not for precise page references.
@@ -205,8 +212,6 @@ class LegalPDFParser:
         total_chars = len(doc_result.full_text)
         if total_chars == 0:
             return 1
-        
         ratio = char_offset / total_chars
         estimated = max(1, int(ratio * doc_result.total_pages))
         return estimated
-    
