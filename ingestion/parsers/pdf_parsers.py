@@ -1,6 +1,4 @@
 """
-legal_pdf_parser.py  (updated — Phase 2.1 replacement)
--------------------------------------------------------
 Legal PDF parser that uses GovernmentPDFOCRHandler as its extraction backend.
 Replaces the original pdfplumber-only parser with full OCR support.
 
@@ -15,7 +13,7 @@ import re
 import logging
 from dataclasses import dataclass
 
-from ocr_handler import GovernmentPDFOCRHandler, DocumentResult
+from ingestion.parsers.ocr_handler import GovernmentPDFOCRHandler, DocumentResult
 from constants import (
     BARE_SECTION_PATTERN,
     DEFINITION_BODY_MAX_LEN,
@@ -29,6 +27,7 @@ from constants import (
     RASTERIZE_DPI,
     SECTION_PATTERN,
     SECTION_REVIEW_CONFIDENCE_THRESHOLD,
+    _PAGE_HEADER
 )
 
 logger = logging.getLogger(__name__)
@@ -44,11 +43,11 @@ class LegalSection:
     content: str
     page_start: int
     last_verified: str
-    ocr_confidence: float = 1.0          # new: propagated from OCR handler
-    needs_review: bool = False           # new: flagged for manual review
+    ocr_confidence: float = 1.0          
+    needs_review: bool = False     
 
 
-# Updated parser
+# parser
 class LegalPDFParser:
     """
     Parses legal PDFs into structured LegalSection objects.
@@ -74,7 +73,7 @@ class LegalPDFParser:
             "last_verified": "2024-01",
         }
         """
-        # 1. Extract text (handles scanned/digital/mixed automatically)
+        # Extract text (handles scanned/digital/mixed automatically)
         doc_result: DocumentResult = self.ocr_handler.process_document(pdf_path)
 
         if not doc_result.full_text.strip():
@@ -87,17 +86,17 @@ class LegalPDFParser:
             f"({doc_result.digital_pages} digital, {doc_result.scanned_pages} scanned)"
         )
 
-        # 2. Build page → confidence mapping for propagation
+        # Build page → confidence mapping for propagation
         page_confidence_map = {
             p.page_number: p.confidence for p in doc_result.pages
         }
 
-        # 3. Extract definitions block (injected into every chunk later)
+        # Extract definitions block (injected into every chunk later)
         definitions = self._extract_definitions(doc_result.full_text)
         if definitions:
             logger.info(f"Found {len(definitions)} defined terms")
 
-        # 4. Split into sections
+        # Split into sections
         sections = self._split_into_sections(
             text=doc_result.full_text,
             metadata=metadata,
@@ -123,11 +122,18 @@ class LegalPDFParser:
         matches = list(SECTION_PATTERN.finditer(text))
 
         if len(matches) < MIN_SECTION_MATCHES:
-            logger.warning(
-                f"Primary section pattern found only {len(matches)} matches. "
-                f"Trying bare-number fallback."
-            )
-            matches = list(BARE_SECTION_PATTERN.finditer(text))
+            bare_matches = list(BARE_SECTION_PATTERN.finditer(text))
+            if len(bare_matches) > len(matches):
+                logger.warning(
+                    f"Primary section pattern found only {len(matches)} matches. "
+                    f"Trying bare-number fallback."
+                )
+                matches = bare_matches
+            else:
+                logger.warning(
+                    f"Primary pattern found {len(matches)} matches — "
+                    f"bare fallback found {len(bare_matches)}, keeping primary."
+                )
 
         if not matches:
             logger.error(
@@ -142,14 +148,48 @@ class LegalPDFParser:
                 page_start=1,
                 last_verified=metadata["last_verified"],
                 ocr_confidence=doc_result.avg_ocr_confidence,
+                needs_review=(
+                    doc_result.avg_ocr_confidence < SECTION_REVIEW_CONFIDENCE_THRESHOLD
+                ),
             )]
 
         sections = []
         for i, match in enumerate(matches):
             # Section content = text from end of header to start of next header
             content_start = match.end()
-            content_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-            content = text[content_start:content_end].strip()
+            content_end   = matches[i+1].start() if i+1 < len(matches) else len(text)
+            raw_content   = text[content_start:content_end]
+
+            # Skip wrapped title lines — real content starts at the first line
+            # that begins with a clause marker: (1), a capital letter starting
+            # a full sentence, or a digit. Wrapped title fragments are short
+            # lowercase continuations like "emises in new building."
+            lines = raw_content.split('\n')
+            # AFTER
+            start_line = 0
+            for j, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                is_clause         = stripped.startswith('(')
+                is_capital_sent   = len(stripped) > 20 and stripped[0].isupper()
+                is_digit_start    = stripped[0].isdigit() and stripped[1:3] in ('. ', ') ')
+                is_chapter_header = stripped.isupper() and len(stripped) > 5
+                is_page_header    = bool(_PAGE_HEADER.match(stripped))
+                is_lowercase_cont = stripped[0].islower()
+
+                # Skip these — they are never real content starts
+                if is_chapter_header or is_page_header or is_lowercase_cont:
+                    start_line = j + 1
+                    continue
+
+                # This is real content — stop here
+                if is_clause or is_capital_sent or is_digit_start:
+                    start_line = j
+                    break
+
+            content = '\n'.join(lines[start_line:]).strip()
 
             # Skip near-empty sections
             if len(content.split()) < MIN_SECTION_WORDS:

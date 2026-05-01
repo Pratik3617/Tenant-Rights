@@ -1,0 +1,38 @@
+# docker-compose.yml
+services:
+  weaviate:
+    image: semitechnologies/weaviate:1.27.1
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: node1
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    restart: on-failure
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: on-failure
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tenantrag
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: on-failure
+
+volumes:
+  weaviate_data:
+  pg_data:
